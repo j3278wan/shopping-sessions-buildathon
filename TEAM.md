@@ -1,5 +1,5 @@
 # Team
 
-Name:
+Name: SJJJ
 Members:
-Engine: DuckDB
+Engine: C++17, Apache Arrow and Parquet

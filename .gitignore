@@ -5,3 +5,5 @@ __pycache__/
 dev/
 out/
 dev-answer/
+build/
+dev-*/

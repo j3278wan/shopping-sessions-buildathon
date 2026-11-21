@@ -30,3 +30,7 @@ run-dev: build
 ANSWER ?= dev-answer
 check-dev:
 	python3 scripts/compare.py out $(ANSWER)
+
+.PHONY: native
+native:
+	sh scripts/build_native.sh

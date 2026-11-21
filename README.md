@@ -1,50 +1,70 @@
 # Shopping Sessions
 
-A DuckDB pipeline for the Builders Buildathon's Databricks track. It reads shopping events, ad clicks and identity links, then writes two daily Parquet tables. The data and expected answers used for verification come from the organizer's [Shopping Sessions track](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions).
+This repository contains the SJJJ team's solution to the [Databricks Shopping Sessions challenge](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). The submission reads the supplied CSVs, resolves linked shoppers, and writes the two required daily reports as Apache Parquet. The optimized executable is C++17. The earlier DuckDB implementation remains in `pipeline/` for comparison.
 
-## How it works
+## How the executable works
 
-- `pipeline/events.py` reads the track's CSV dialect and cleans events. Deduplication keeps the earliest ingested copy before validation.
-- `pipeline/identity.py` resolves linked IDs across files. Every event and click uses the smallest ID in its connected component.
-- `pipeline/pipeline.py` sorts each person's events, starts a session after gaps strictly over 30 minutes, and groups its events and purchases by the UTC day the session began.
-- `pipeline/advertising.py` assigns each session to the latest eligible click, breaking timing ties by click ID. Overlapping seven-day intervals from the same campaign are merged so that it assists a given session only once.
+1. Read the reporting window from the manifest and resolve identity links using a union-find whose canonical name is the smallest ID in the component.
+2. Process complete lines in parallel from the memory-mapped CSV input. The CSV scanner checks the exact quoting rules and preserves whitespace. For every event ID the earliest ingested copy wins, including when that copy is invalid. Hash collisions are resolved by comparing the original IDs.
+3. Group each shopper's surviving events and ad clicks into the same partition. Sort the shopper's timeline and start a new session only when the gap exceeds 30 minutes.
+4. Advance a seven-day click window alongside each shopper's sessions. The latest eligible click wins the revenue. Each distinct campaign in the window also records one assist.
+5. Write the user-day shards and the combined campaign-day table through Arrow's Parquet writer. All partitioning and dictionaries are derived from the supplied input.
 
-The full input and output specifications are in `rules.md`.
+The organizer's full input/output contract is in `rules.md`.
 
-## Verify locally
+## Run and check
 
-Use Python 3.10+ and install the runtime and test dependencies in a virtual environment:
+The root Dockerfile compiles for the image platform. The scorer uses Linux/amd64, 8 vCPUs and 24 GB of memory. The C++ build links the Arrow and Parquet libraries in the pinned PyArrow wheel. Input is mounted at `/data` and the scorer supplies a fresh `/output` directory. The runtime needs no network.
+
+```sh
+make build
+make fixtures
+```
+
+For a native run on macOS or Linux, install a C++17 compiler, Python 3.10+ and the local test dependencies:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -r requirements.txt polars
-scratch_dir=$(mktemp -d)
-export SCRATCH_DIR="$scratch_dir"
-python scripts/run_fixtures.py fixtures -- python pipeline/pipeline.py
+python -m pip install pyarrow==20.0.0 polars
+make native
+python scripts/run_fixtures.py fixtures -- ./build/shopping-sessions
 ```
 
-The 36 fixtures cover dirty CSVs, millisecond time boundaries, cross-device shopping sessions and ad attribution. To inspect a single example's two outputs:
-
-```sh
-DATA_DIR=fixtures/A11/input OUTPUT_DIR="$scratch_dir/example" python pipeline/pipeline.py
-python scripts/compare.py "$scratch_dir/example" fixtures/A11/expected
-```
-
-For the public development set, download the official generator and reference answers from the track page. Build the generator according to its README, then run:
+To verify the public development set, build the generator from the track page, download and extract `dev-answer.zip`, then run:
 
 ```sh
 generate --seed 1 --events 1000000 --clicks 250000 --output dev
-DATA_DIR=dev OUTPUT_DIR=out python pipeline/pipeline.py
-python scripts/compare.py out dev-answer
+out=$(mktemp -d)
+DATA_DIR=dev OUTPUT_DIR="$out" NCPU=8 ./build/shopping-sessions
+python scripts/compare.py "$out" dev-answer
 ```
 
-The final line should print `MATCH`. The two Parquet outputs are in `out/user_daily/` and `out/campaign_daily/`. The public answers for this seed have 117,038 user-day rows and 27,400 campaign-day rows. Keep the generated dataset, output and answers outside Git.
+For repeated native runs, supply a fresh output directory each time. The official comparison ignores row order and file count, and checks column types, duplicate keys and both full tables.
 
-## Running on the scorer
+## Reproduce the larger benchmark
 
-The top-level `Dockerfile` packages the pipeline. The scorer mounts input at `/data`, output at `/output`, and writable temporary space at `/scratch`. Its time includes container start-up, reading, computing, and writing both tables. To reproduce the target platform locally with Docker and buildx, use `make build` followed by `make fixtures` or `make run-dev`. Local public-data timings and the leaderboard use different machines and datasets.
+Use the official generator with an independent seed. Keep generated input and reports outside Git. The previous DuckDB version and the native program can read the same dataset.
+
+```sh
+generate --seed 73 --events 20000000 --clicks 5000000 --output dev-20m
+out=$(mktemp -d)
+time env DATA_DIR=dev-20m OUTPUT_DIR="$out" NCPU=8 ./build/shopping-sessions
+```
+
+For a stage breakdown, set `SHOPPING_TRACE=1` and `SHOPPING_TIMINGS=1`. To check against the earlier implementation, install `requirements.txt`, use a separate writable scratch and output directory, run `python pipeline/pipeline.py` with the same input, then compare the two outputs using `scripts/compare.py`. Hidden practice and final data are only tested by the organizer.
+
+## Measured locally
+
+On an Apple M1 Pro with eight worker threads, the official generator's seed 73 produced 20 million events and 5 million clicks. Both versions read the same input after warming the file cache and wrote to a fresh output directory for each trial. Wall time includes process startup and Parquet output.
+
+| Implementation | Three runs (seconds) | Median |
+| --- | --- | --- |
+| DuckDB, commit `ec136af` | 28.54, 29.65, 35.26 | 29.65 s |
+| Native C++ | 2.62, 2.39, 1.95 | 2.39 s |
+
+The local speedup is 12.4×. The organizer measures rankings on separate Linux machines with hidden data.
 
 ## Credits
 
-Based on the organizer's DuckDB starter. The Dockerfile, Makefile, runner, official fixtures, specification and comparison scripts originated in that kit. The processing code uses DuckDB and the Python standard library. Polars is used by the organizer's local verification scripts.
+Based on the organizer's DuckDB starter, fixtures, specification, Makefile and verification scripts. The native implementation uses Apache Arrow and Apache Parquet for serialization. Polars is used by the organizer's verification scripts.
