@@ -1,0 +1,183 @@
+--- a/native/ingest.cpp
++++ b/native/ingest.cpp
+@@ -1,5 +1,5 @@
+ #include "common.hpp"
+-#include "csv.hpp"
++#include "records.hpp"
+ #include "time.hpp"
+ #include <algorithm>
+ #include <array>
+@@ -453,7 +453,7 @@
+     }
+ };
+ 
+-template <class Row, class Parse, class Emit>
++template <size_t N, class Row, class Parse, class Emit>
+ void batched_rows(Text input, UserCache &cache, Parse &parse, Emit emit) {
+     // Work on subsequent rows while their immutable identity-link slots enter the CPU cache.
+     std::array<Row, user_lookup_batch_size> rows;
+@@ -468,8 +468,8 @@
+         n = 0;
+         cache.count = 0;
+     };
+-    lines(input, [&](Text line) {
+-        if (parse(line, cache, rows[n])) {
++    strict_records::rows<N>(input, [&](const std::array<Text,N>& fields) {
++        if (parse(fields, cache, rows[n])) {
+             if (++n == rows.size())
+                 flush();
+         }
+@@ -671,7 +671,7 @@
+     std::vector<UserCache> caches(threads);
+     auto jobs = chunks(parts);
+     parallel(jobs.size(), threads, [&](size_t w, size_t j) {
+-        batched_rows<EventCandidate>(jobs[j], caches[w], parse, [&](const EventCandidate &c) {
++        batched_rows<7,EventCandidate>(jobs[j], caches[w], parse, [&](const EventCandidate &c) {
+             const uint64_t hash = c.external ? std::hash<Text>{}(c.id.text()) : c.id.bits;
+             parsed[w][hash & (partitions - 1)].push_back(c);
+         });
+@@ -735,7 +735,7 @@
+     parallel(jobs.size(), threads, [&](size_t worker, size_t j) {
+         if (overflow.load(std::memory_order_relaxed))
+             return;
+-        batched_rows<EventCandidate>(jobs[j], caches[worker], parse, [&](EventCandidate &row) {
++        batched_rows<7,EventCandidate>(jobs[j], caches[worker], parse, [&](EventCandidate &row) {
+             uint64_t hash = row.external ? std::hash<Text>{}(row.id.text()) : row.id.bits;
+             const int64_t seconds = row.ingest / 1000 - epoch;
+             if (row.ingest == INVALID_TIME || seconds < INT32_MIN || seconds > INT32_MAX) {
+@@ -865,7 +865,7 @@
+     std::vector<UserCache> caches(threads);
+     auto jobs = chunks(parts);
+     parallel(jobs.size(), threads, [&](size_t w, size_t j) {
+-        batched_rows<Click>(jobs[j], caches[w], parse,
++        batched_rows<4,Click>(jobs[j], caches[w], parse,
+                             [&](Click &click) { rows[w][click.person % partitions].push_back(click); });
+     });
+     // Equal click IDs have identical fields by contract. Last-touch picks the
+@@ -900,9 +900,8 @@
+     tick("lookups");
+     auto event_files = csv_parts(*files, data / "events");
+     const int selected_prefix = event_prefix(event_files);
+-    auto parse_event = [&](Text line, UserCache &users, EventCandidate &c) {
+-        std::array<Text, 7> f;
+-        if (!split_fields(line, f) || f[0].empty())
++    auto parse_event = [&](const std::array<Text,7>& f, UserCache &users, EventCandidate &c) {
++        if (f[0].empty())
+             return false;
+         uint32_t external;
+         const auto event_id = EventId::encode(f[0], selected_prefix, external);
+@@ -928,9 +927,8 @@
+     if (!collect_tickets(event_files, threads, out.events, start_ms, parse_event))
+         collect_wide_events(event_files, threads, out.events, parse_event);
+     tick("events");
+-    auto parse_click = [&](Text line, UserCache &users, Click &c) {
+-        std::array<Text, 4> f;
+-        if (!split_fields(line, f) || f[0].empty() || f[1].empty())
++    auto parse_click = [&](const std::array<Text,4>& f, UserCache &users, Click &c) {
++        if (f[0].empty() || f[1].empty())
+             return false;
+         int64_t ts = users.times.strict(f[3]);
+         if (ts < start_ms - 7 * DAY || ts >= end_ms)
+--- /dev/null
++++ b/native/records.hpp
+@@ -0,0 +1,100 @@
++#pragma once
++#include "csv.hpp"
++#include <algorithm>
++#include <array>
++namespace strict_records {
++using View=std::string_view;
++#if defined(__x86_64__) && defined(__AVX2__) && defined(__BMI2__)
++struct Block {uint64_t comma,quote,newline;};
++inline Block block32(const char *p) {
++    auto v=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
++    return {uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8(',')))),
++            uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8('"')))),
++            uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8('\n'))))};
++}
++inline void scan_avx2(const char* p,size_t count,Block* out) {
++    for(size_t i=0;i<count;++i,p+=64){
++        Block a=block32(p),b=block32(p+32);
++        out[i]={a.comma|(b.comma<<32),a.quote|(b.quote<<32),a.newline|(b.newline<<32)};
++    }
++}
++__attribute__((target("avx512f,avx512bw"))) inline void scan_wide(const char* p,size_t count,Block* out) {
++    for(size_t i=0;i<count;++i,p+=64){
++        auto v=_mm512_loadu_si512(p);
++        out[i]={_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8(',')),
++                _mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8('"')),
++                _mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8('\n'))};
++    }
++}
++inline uint64_t join_bits(uint64_t low,uint64_t high,unsigned shift) {
++    return (static_cast<__uint128_t>(high)<<64|low)>>shift;
++}
++inline uint64_t low_bits(unsigned n) {
++    return ~uint64_t{0}>>(64-n);
++}
++template<size_t N,class F>
++void page_rows(View input,F& consume) {
++    constexpr size_t count=64,page_bytes=count*64;
++    std::array<Block,count+2> mask;
++    const char* next=input.data();
++    auto end=next+input.size();
++    const char* begin=next;
++    const bool wide=__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
++    std::array<View,N> fields;
++    while(size_t(end-next)>=64){
++        auto blocks=std::min<size_t>((end-next)/64,count);
++        if(wide)scan_wide(next,blocks,mask.data());
++        else scan_avx2(next,blocks,mask.data());
++        mask[blocks]={};mask[blocks+1]={};
++        for(size_t b=0;b<blocks;++b){
++            auto breaks=mask[b].newline;
++            while(breaks){
++                auto stop=next+b*64+__builtin_ctzll(breaks);
++                breaks&=breaks-1;
++                View line(begin,static_cast<size_t>(stop-begin));
++                bool valid;
++                if(begin>=next && line.size()>=32 && line.size()<=128){
++                    auto pos=static_cast<unsigned>(begin-next);
++                    auto shift=pos&63;
++                    auto* m=mask.data()+(pos>>6);
++                    csv_isa::Masks low{join_bits(m[0].comma,m[1].comma,shift),
++                                       join_bits(m[0].quote,m[1].quote,shift)};
++                    csv_isa::Masks high{};
++                    if(line.size()<=64){
++                        uint64_t keep=low_bits(line.size());low.commas&=keep;low.quotes&=keep;
++                    }else{
++                        uint64_t keep=low_bits(line.size()-64);
++                        high={join_bits(m[1].comma,m[2].comma,shift)&keep,
++                              join_bits(m[1].quote,m[2].quote,shift)&keep};
++                    }
++                    valid=csv_isa::decode(line,fields,low,high);
++                }else valid=split_fields(line,fields);
++                if(valid)consume(fields);
++                begin=stop+1;
++            }
++        }
++        next+=blocks*64;
++    }
++    while(begin<end){
++        auto* lf=static_cast<const char*>(std::memchr(next,'\n',static_cast<size_t>(end-next)));
++        const char* stop=lf?lf:end;
++        if(split_fields(View(begin,static_cast<size_t>(stop-begin)),fields))consume(fields);
++        if(!lf)break;
++        begin=next=stop+1;
++    }
++}
++#endif
++template<size_t N,class F> void rows(View input,F consume) {
++    if(input.empty())return;
++#if defined(__x86_64__) && defined(__AVX2__) && defined(__BMI2__)
++    page_rows<N>(input,consume);
++#else
++    while(!input.empty()){
++        auto lf=input.find('\n');std::array<View,N> f;
++        if(split_fields(input.substr(0,lf),f))consume(f);
++        if(lf==View::npos)break;
++        input.remove_prefix(lf+1);
++    }
++#endif
++}
++}

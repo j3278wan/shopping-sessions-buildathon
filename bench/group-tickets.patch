@@ -1,0 +1,162 @@
+--- a/native/ingest.cpp
++++ b/native/ingest.cpp
+@@ -759,84 +759,86 @@
+     });
+     if (overflow.load(std::memory_order_relaxed))
+         return false;
++    const unsigned worker_bits=threads==1 ? 0 : 64-__builtin_clzll(threads-1);
++    const uint32_t worker_mask=static_cast<uint32_t>((uint64_t{1}<<worker_bits)-1);
++    const uint64_t max_rows=(uint64_t(UINT32_MAX)-threads)>>worker_bits;
++    for(const auto& worker:ids)
++        for(const auto& list:worker)
++            if(list.size()>max_rows)return false;
+     trace("parse and partition");
+-    parallel(shards, threads, [&](size_t, size_t part) {
+-        std::vector<size_t> starts(threads + 1);
+-        for (int w = 0; w < threads; ++w)
+-            starts[w + 1] = starts[w] + ids[w][part].size();
+-        const size_t total = starts.back();
+-        if (!total)
+-            return;
+-        size_t cap = 1;
+-        while (cap < total + total / 3 + 1)
+-            cap *= 2;
+-        unsigned sb = __builtin_ctzll(shards), ab = __builtin_ctzll(cap),
+-                 rb = 64 - __builtin_clzll(total);
+-        // Shard, home slot and upper bits reconstruct the full bijective key.
+-        // Saving the probe distance recovers the home slot after a collision.
+-        // Entries that probe farther use a full-key overflow map.
+-        const uint64_t mask = (uint64_t(1) << rb) - 1;
+-        unsigned pb = std::min<unsigned>(5, sb), max_probe = 1u << pb;
+-        std::vector<uint64_t> table(cap);
+-        std::unordered_map<Text, size_t> external;
+-        std::unordered_map<uint64_t, size_t> crowded;
+-        auto drop = [&](const Ticket &row, size_t owner) {
+-            uint32_t dest = row.destination & INT32_MAX;
+-            // The ticket shard owns every copy of this ID, and distinct
+-            // tickets refer to distinct stationary Event objects.
+-            if (dest)
+-                rows[owner][dest & pmask][(dest >> shift) - 1].person = NONE;
++    parallel(shards,threads,[&](size_t,size_t part) {
++        // Four candidate fingerprints and row references fit in half a cache line.
++        struct alignas(32) Group {
++            uint64_t tags=0;
++            uint32_t refs[4]{};
++            uint32_t used=0;
+         };
+-        for (int w = 0; w < threads; ++w) {
+-            auto &part_rows = ids[w][part];
+-            for (size_t n = 0; n < part_rows.size(); ++n) {
+-                const auto &row = part_rows[n];
+-                const uint64_t h = row.id.bits;
+-                const size_t ref = starts[w] + n + 1;
+-                auto supersedes = [&](size_t old_ref) {
+-                    const size_t old = old_ref - 1;
+-                    const size_t owner =
+-                        std::upper_bound(starts.begin(), starts.end(), old) - starts.begin() - 1;
+-                    const auto &other = ids[owner][part][old - starts[owner]];
+-                    if (row.time < other.time) {
+-                        drop(other, owner);
+-                        return true;
++        const unsigned shard_bits=__builtin_ctzll(shards);
++        constexpr uint64_t ones=UINT64_C(0x0001000100010001);
++        constexpr uint64_t highs=UINT64_C(0x8000800080008000);
++        size_t total=0;
++        std::vector<const Ticket*> sources(threads);
++        for(int w=0;w<threads;++w){
++            sources[w]=ids[w][part].data();
++            total+=ids[w][part].size();
++        }
++        if(!total)return;
++        size_t cap=1;
++        while(cap*4<total+total/3+1)cap*=2;
++        std::vector<Group> table(cap);
++        std::unordered_map<Text,uint32_t> external;
++        std::unordered_map<uint64_t,uint32_t> crowded;
++        auto drop=[&](const Ticket& ticket,size_t owner) {
++            uint32_t dest=ticket.destination&INT32_MAX;
++            if(dest)rows[owner][dest&pmask][(dest>>shift)-1].person=NONE;
++        };
++        auto previous=[&](uint32_t ref)->const Ticket& {
++            --ref;
++            return sources[ref&worker_mask][ref>>worker_bits];
++        };
++        for(int w=0;w<threads;++w) {
++            const auto& part_rows=ids[w][part];
++            for(size_t n=0;n<part_rows.size();++n) {
++                const auto& row=part_rows[n];
++                const auto ref=static_cast<uint32_t>(((uint64_t(n)<<worker_bits)|w)+1);
++                auto pick=[&](uint32_t& old) {
++                    if(!old){old=ref;return;}
++                    const auto& other=previous(old);
++                    if(row.time<other.time){
++                        drop(other,(old-1)&worker_mask);
++                        old=ref;
++                    }else drop(row,w);
++                };
++                if(row.destination>>31){pick(external[row.id.text()]);continue;}
++                const uint64_t h=row.id.bits, tag=(h>>48)|1;
++                const uint64_t repeated=tag*ones;
++                size_t slot=(h>>shard_bits)&(cap-1);
++                bool found=false;
++                for(unsigned probe=0;probe<8;++probe,slot=(slot+1)&(cap-1)) {
++                    auto& g=table[slot];
++                    const auto diff=g.tags^repeated;
++                    uint64_t matches=(diff-ones)&~diff&highs;
++                    while(matches){
++                        const unsigned lane=__builtin_ctzll(matches)/16;
++                        if(lane>=g.used)break;
++                        if(previous(g.refs[lane]).id.bits==h){
++                            pick(g.refs[lane]);
++                            found=true;break;
++                        }
++                        matches&=matches-1;
+                     }
+-                    drop(row, w);
+-                    return false;
+-                };
+-                if (row.destination >> 31) {
+-                    auto &old = external[row.id.text()];
+-                    if (!old || supersedes(old))
+-                        old = ref;
+-                    continue;
+-                }
+-                const uint64_t upper = (h >> (ab + sb)) << pb;
+-                size_t slot = (h >> sb) & (cap - 1);
+-                bool found = false;
+-                for (unsigned probe = 0; probe < max_probe; ++probe, slot = (slot + 1) & (cap - 1)) {
+-                    const uint64_t tag = (upper | probe) << rb, word = table[slot];
+-                    if (!word) {
+-                        table[slot] = tag | ref;
+-                        found = true;
+-                        break;
+-                    }
+-                    if ((word & ~mask) == tag) {
+-                        if (supersedes(word & mask))
+-                            table[slot] = tag | ref;
+-                        found = true;
+-                        break;
++                    if(found)break;
++                    if(g.used<4){
++                        const auto lane=g.used++;
++                        g.tags|=tag<<(lane*16);
++                        g.refs[lane]=ref;
++                        found=true;break;
+                     }
+                 }
+-                if (!found) {
+-                    auto &old = crowded[h];
+-                    if (!old || supersedes(old))
+-                        old = ref;
+-                }
+-            }
+-        }
+-        for (auto &worker : ids)
+-            std::vector<Ticket>().swap(worker[part]);
++                if(!found)pick(crowded[h]);
++            }
++        }
++        for(auto& worker:ids)std::vector<Ticket>().swap(worker[part]);
+     });
+     trace("deduplicate");
+     parallel(partitions, threads, [&](size_t, size_t part) {
