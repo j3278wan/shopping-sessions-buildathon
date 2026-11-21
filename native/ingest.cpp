@@ -168,6 +168,10 @@ template <class Value = uint32_t> class Index {
     }
 
   public:
+    void prefetch(size_t hash) const {
+        if (!table.empty())
+            __builtin_prefetch(&table[hash & (table.size() - 1)], 0, 1);
+    }
     const Value *find(const Key &key, size_t hash) const {
         if (table.empty())
             return nullptr;
@@ -208,7 +212,21 @@ uint32_t intern(Index<> &index, std::vector<Text> &names, Text key) {
     });
 }
 
+size_t estimate_rows(const std::vector<Text> &parts);
+std::vector<Text> chunks(const std::vector<Text> &parts);
+template <class Func> void parallel(size_t count, int workers, Func func);
+
 class People {
+    struct FastSlot {
+        std::atomic<uint64_t> suffix{0};
+        uint32_t person = NONE;
+    };
+    // For one observed (byte length, first byte), the remaining ≤8 bytes are
+    // an exact dictionary key. Other shapes, including an all-zero suffix,
+    // take the general byte-string path. The shape is a storage decision only.
+    size_t fast_length = 0, capacity = 0;
+    unsigned char fast_prefix = 0;
+    std::unique_ptr<FastSlot[]> slots;
     Index<> linked;
     std::vector<Text> &names;
     std::vector<uint32_t> parents;
@@ -220,51 +238,182 @@ class People {
     std::array<Shard, 64> added;
     std::atomic<uint32_t> next{0};
 
-    uint32_t link_id(Text key) {
-        return linked.add(key, [&] {
-            uint32_t id = static_cast<uint32_t>(names.size());
-            names.push_back(key);
-            parents.push_back(id);
+    void choose_shape(const std::vector<Text> &parts) {
+        std::array<size_t, 10 * 256> bins{};
+        size_t sample = 0;
+        std::array<Text, 2> sides;
+        for (auto part : parts) {
+            auto body = after_header(part);
+            while (sample < 2048 && !body.empty()) {
+                auto pos = body.find('\n');
+                auto line = body.substr(0, pos);
+                body.remove_prefix(pos == Text::npos ? body.size() : pos + 1);
+                if (!split_fields(line, sides))
+                    continue;
+                for (auto side : sides) {
+                    if (side.empty())
+                        continue;
+                    ++sample;
+                    if (side.size() >= 2 && side.size() <= 9)
+                        ++bins[side.size() * 256 + static_cast<unsigned char>(side.front())];
+                }
+            }
+            if (sample >= 2048)
+                break;
+        }
+        auto best = std::max_element(bins.begin(), bins.end());
+        if (!sample || *best * 2 < sample)
+            return;
+        auto code = static_cast<size_t>(best - bins.begin());
+        fast_length = code / 256;
+        fast_prefix = static_cast<unsigned char>(code % 256);
+        size_t target = std::max<size_t>(1024, estimate_rows(parts) * 2);
+        capacity = 1024;
+        while (capacity < target && capacity < (1u << 24))
+            capacity *= 2;
+        slots = std::make_unique<FastSlot[]>(capacity);
+        names.resize(capacity);
+        next.store(static_cast<uint32_t>(capacity), std::memory_order_relaxed);
+    }
+
+    // Claiming the slot itself assigns the numeric ID for a new singleton.
+    // The original string view is consumed only after all workers join.
+    uint32_t fast_slot(Text name, uint64_t key, size_t hash) {
+        size_t pos = hash & (capacity - 1);
+        for (size_t probe = 0; probe < 24; ++probe, pos = (pos + 1) & (capacity - 1)) {
+            auto &slot = slots[pos];
+            uint64_t found = slot.suffix.load(std::memory_order_relaxed);
+            if (!found) {
+                if (slot.suffix.compare_exchange_strong(found, key, std::memory_order_relaxed)) {
+                    names[pos] = name;
+                    return static_cast<uint32_t>(pos);
+                }
+            }
+            if (found == key)
+                return slot.person == NONE ? static_cast<uint32_t>(pos) : slot.person;
+        }
+        // This prefix of slots is permanently full. Falling back is stable
+        // across workers and across build/run phases, regardless of schedule.
+        return NONE;
+    }
+    uint32_t singleton(Text text, const Key &key, size_t hash) {
+        auto &shard = added[(hash >> 16) % added.size()];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        return shard.new_ids.get_or_insert(key, hash, [&] {
+            const auto id = next.fetch_add(1, std::memory_order_relaxed);
+            shard.names.emplace_back(text, id);
             return id;
         });
     }
-    uint32_t root(uint32_t i) {
-        while (i != parents[i]) {
-            parents[i] = parents[parents[i]];
-            i = parents[i];
+    uint32_t link_id(Text text) {
+        auto key = encode(text);
+        if (key.last == 0) {
+            auto id = fast_slot(text, key.first, key.hash());
+            if (id != NONE)
+                return id;
+            key = Key(text);
         }
-        return i;
+        return singleton(text, key, key.hash());
+    }
+    uint32_t root(uint32_t id) {
+        while (id != parents[id]) {
+            parents[id] = parents[parents[id]];
+            id = parents[id];
+        }
+        return id;
     }
 
   public:
     explicit People(std::vector<Text> &output) : names(output) {}
-    void prepare(const std::vector<Text> &parts) {
-        std::array<Text, 2> fields;
-        for (Text part : parts)
-            lines(after_header(part), [&](Text line) {
+    Key encode(Text text) const {
+        if (text.size() == fast_length && fast_length &&
+            static_cast<unsigned char>(text[0]) == fast_prefix) {
+            uint64_t tail = 0;
+            if (fast_length == 9)
+                std::memcpy(&tail, text.data() + 1, 8);
+            else
+                std::memcpy(&tail, text.data() + 1, fast_length - 1);
+            if (tail) {
+                Key key;
+                key.first = tail;
+                return key;
+            }
+        }
+        return Key(text);
+    }
+    void prepare(const std::vector<Text> &parts, int threads) {
+        choose_shape(parts);
+        const auto jobs = chunks(parts);
+        using Edge = std::pair<uint32_t, uint32_t>;
+        std::vector<std::vector<Edge>> edges(threads);
+        const auto estimated = estimate_rows(parts);
+        for (auto &out : edges)
+            out.reserve(estimated / threads);
+        parallel(jobs.size(), threads, [&](size_t worker, size_t j) {
+            std::array<Text, 2> fields;
+            lines(jobs[j], [&](Text line) {
                 if (!split_fields(line, fields) || fields[0].empty() || fields[1].empty())
                     return;
-                uint32_t a = root(link_id(fields[0])), b = root(link_id(fields[1]));
+                auto a = link_id(fields[0]);
+                auto b = link_id(fields[1]);
+                if (a != b)
+                    edges[worker].emplace_back(a, b);
+            });
+        });
+        // All names are stable once the workers join. Canonicalize exact
+        // raw endpoint IDs with one union pass over compact integer pairs.
+        finish();
+        parents.resize(names.size());
+        for (size_t i = 0; i < parents.size(); ++i)
+            parents[i] = static_cast<uint32_t>(i);
+        for (const auto &list : edges)
+            for (auto [left, right] : list) {
+                auto a = root(left), b = root(right);
                 if (a == b)
-                    return;
+                    continue;
                 if (names[b] < names[a])
                     std::swap(a, b);
                 parents[b] = a;
-            });
-        linked.each_value([&](uint32_t &id) { id = root(id); });
+            }
+        // Compress before the concurrent read phase. A long descending-name
+        // link chain can otherwise leave thousands of pointers per lookup.
+        for (size_t i = 0; i < parents.size(); ++i)
+            if (parents[i] != i)
+                parents[i] = root(static_cast<uint32_t>(i));
+        parallel((capacity + 8191) / 8192, threads, [&](size_t, size_t block) {
+            for (size_t i = block * 8192; i < std::min(capacity, (block + 1) * 8192); ++i) {
+                if (!slots[i].suffix.load(std::memory_order_relaxed))
+                    continue;
+                slots[i].person = parents[i];
+            }
+        });
+        for (auto &shard : added) {
+            for (auto [name, id] : shard.names) {
+                const auto canonical = root(id);
+                linked.add(name, [canonical] { return canonical; });
+            }
+            shard.new_ids = Index<>();
+            std::vector<std::pair<Text, uint32_t>>().swap(shard.names);
+        }
         std::vector<uint32_t>().swap(parents);
-        next.store(static_cast<uint32_t>(names.size()));
     }
-    uint32_t lookup(Text name, const Key &key, size_t hash) {
+    void prefetch(const Key &key, size_t hash) const {
+        if (key.last == 0)
+            __builtin_prefetch(&slots[hash & (capacity - 1)], 0, 1);
+        else
+            linked.prefetch(hash);
+    }
+    uint32_t lookup(Text name, Key key, size_t hash) {
+        if (key.last == 0) {
+            auto id = fast_slot(name, key.first, hash);
+            if (id != NONE)
+                return id;
+            key = Key(name);
+            hash = key.hash();
+        }
         if (auto p = linked.find(key, hash))
             return *p;
-        auto &s = added[(hash >> 16) % added.size()];
-        std::lock_guard<std::mutex> lock(s.mutex);
-        return s.new_ids.get_or_insert(key, hash, [&] {
-            uint32_t id = next.fetch_add(1, std::memory_order_relaxed);
-            s.names.emplace_back(name, id);
-            return id;
-        });
+        return singleton(name, key, hash);
     }
     void finish() {
         names.resize(next.load());
@@ -274,22 +423,71 @@ class People {
     }
 };
 
+constexpr size_t user_lookup_batch_size = 32;
+
 struct UserCache {
     shopping_time::Parser times;
     struct Cached {
         Key name;
         uint32_t id;
     };
+    struct Request {
+        Text name;
+        Key key;
+        size_t hash;
+        uint32_t known_id;
+    };
     std::vector<Cached> slots = std::vector<Cached>(16384);
-    uint32_t operator()(People &people, Text name) {
-        Key key(name);
-        size_t hash = key.hash();
-        auto &hit = slots[hash & (slots.size() - 1)];
-        if (hit.name != key)
-            hit = {key, people.lookup(name, key, hash)};
+    std::array<Request, user_lookup_batch_size> requests;
+    size_t count = 0;
+    People *people = nullptr;
+
+    // Return a batch-local request index. Resolve to a person ID before emitting the row.
+    uint32_t queue(People &map, Text name) {
+        const Key key = map.encode(name);
+        const size_t hash = key.hash();
+        const auto &hit = slots[hash & (slots.size() - 1)];
+        const auto id = hit.name == key ? hit.id : NONE;
+        if (id == NONE)
+            map.prefetch(key, hash);
+        people = &map;
+        requests[count] = {name, key, hash, id};
+        return static_cast<uint32_t>(count++);
+    }
+    uint32_t resolve(uint32_t index) {
+        const auto &request = requests[index];
+        if (request.known_id != NONE)
+            return request.known_id;
+        auto &hit = slots[request.hash & (slots.size() - 1)];
+        if (hit.name != request.key)
+            hit = {request.key, people->lookup(request.name, request.key, request.hash)};
         return hit.id;
     }
 };
+
+template <class Row, class Parse, class Emit>
+void batched_rows(Text input, UserCache &cache, Parse &parse, Emit emit) {
+    // Work on subsequent rows while their immutable identity-link slots enter the CPU cache.
+    std::array<Row, user_lookup_batch_size> rows;
+    size_t n = 0;
+    auto flush = [&] {
+        for (size_t i = 0; i < n; ++i) {
+            auto &row = rows[i];
+            if (row.person != NONE)
+                row.person = cache.resolve(row.person);
+            emit(row);
+        }
+        n = 0;
+        cache.count = 0;
+    };
+    lines(input, [&](Text line) {
+        if (parse(line, cache, rows[n])) {
+            if (++n == rows.size())
+                flush();
+        }
+    });
+    flush();
+}
 
 int32_t price(Text field) {
     if (field.empty())
@@ -444,10 +642,7 @@ void collect_events(const std::vector<Text> &parts, int threads, std::vector<std
     };
     auto jobs = chunks(parts);
     parallel(jobs.size(), threads, [&](size_t w, size_t j) {
-        lines(jobs[j], [&](Text line) {
-            EventCandidate c;
-            if (!parse(line, caches[w], c))
-                return;
+        batched_rows<EventCandidate>(jobs[j], caches[w], parse, [&](EventCandidate &c) {
             size_t hash = c.id.hash();
             size_t part = hash & (partitions - 1);
             c.partition_hash = static_cast<uint32_t>(hash >> 32);
@@ -493,11 +688,8 @@ void collect_clicks(const std::vector<Text> &parts, int threads, std::vector<std
     std::vector<UserCache> caches(threads);
     auto jobs = chunks(parts);
     parallel(jobs.size(), threads, [&](size_t w, size_t j) {
-        lines(jobs[j], [&](Text line) {
-            Click click;
-            if (parse(line, caches[w], click))
-                rows[w][click.person % partitions].push_back(click);
-        });
+        batched_rows<Click>(jobs[j], caches[w], parse,
+                            [&](Click &click) { rows[w][click.person % partitions].push_back(click); });
     });
     // Equal click IDs have identical fields by contract. Last-touch picks the
     // same tuple, and the sliding assist window reports distinct campaigns.
@@ -520,7 +712,7 @@ Input ingest(const fs::path &data, int threads, int64_t start_ms, int64_t end_ms
     auto files = std::make_shared<Mappings>();
     out.storage = files;
     People people(out.people);
-    people.prepare(csv_parts(*files, data / "links"));
+    people.prepare(csv_parts(*files, data / "links"), threads);
     Catalog catalog;
     catalog.load(out, *files, data);
     size_t partitions = 16;
@@ -549,7 +741,7 @@ Input ingest(const fs::path &data, int threads, int64_t start_ms, int64_t end_ms
             if (auto category = catalog.products.find(f[5]))
                 c.category = *category;
         }
-        c.person = users(people, f[1]);
+        c.person = users.queue(people, f[1]);
         return true;
     };
     collect_events(csv_parts(*files, data / "events"), threads, out.events, parse_event);
@@ -564,7 +756,7 @@ Input ingest(const fs::path &data, int threads, int64_t start_ms, int64_t end_ms
         auto campaign = catalog.campaigns.find(f[2]);
         if (!campaign)
             return false;
-        c = {users(people, f[1]), ts, *campaign, f[0]};
+        c = {users.queue(people, f[1]), ts, *campaign, f[0]};
         return true;
     };
     collect_clicks(csv_parts(*files, data / "clicks"), threads, out.clicks, parse_click);

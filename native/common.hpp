@@ -14,11 +14,16 @@ struct Event {
 };
 
 struct Click {
-    uint32_t person;
     int64_t ts;
-    uint32_t campaign;
     std::string_view id;
+    uint32_t person;
+    uint32_t campaign;
+
+    Click() = default;
+    Click(uint32_t person_, int64_t ts_, uint32_t campaign_, std::string_view id_)
+        : ts(ts_), id(id_), person(person_), campaign(campaign_) {}
 };
+static_assert(sizeof(Click) == 32, "Click records must not contain avoidable padding");
 
 struct Input {
     std::vector<std::string_view> people, categories, campaigns, channels;

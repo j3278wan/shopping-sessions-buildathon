@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -14,6 +16,65 @@ constexpr int64_t week_ms = 7 * day_ms;
 int32_t utc_day(int64_t ts) {
     // Floor rather than truncate when a session starts before the Unix epoch.
     return static_cast<int32_t>(ts / day_ms - (ts % day_ms < 0));
+}
+
+// Large timelines have bounded millisecond ranges in the normal dataset.
+// Use two radix passes only when that range fits uint32_t; arbitrary wider
+// timestamps keep the comparison-sort fallback.
+template <class T, class Order> void sort_timeline(T *begin, T *end, Order order) {
+    const size_t n = end - begin;
+    if (n < 32768) {
+        std::sort(begin, end, order);
+        return;
+    }
+    int64_t lo = begin->ts, hi = lo;
+    for (auto *p = begin + 1; p != end; ++p) {
+        lo = std::min(lo, p->ts);
+        hi = std::max(hi, p->ts);
+    }
+    const uint64_t width = uint64_t(hi) - uint64_t(lo);
+    if (width > std::numeric_limits<uint32_t>::max()) {
+        std::sort(begin, end, order);
+        return;
+    }
+    if (width) {
+        thread_local std::vector<T> scratch;
+        if (scratch.size() < n)
+            scratch.resize(n);
+        std::vector<size_t> counts(std::min<uint64_t>(width + 1, 65536), 0);
+        auto key = [lo](const T &row) { return uint32_t(uint64_t(row.ts) - uint64_t(lo)); };
+        for (auto *p = begin; p != end; ++p)
+            ++counts[key(*p) & 65535];
+        size_t sum = 0;
+        for (auto &count : counts) {
+            size_t size = count;
+            count = sum;
+            sum += size;
+        }
+        for (auto *p = begin; p != end; ++p)
+            scratch[counts[key(*p) & 65535]++] = *p;
+        counts.assign((width >> 16) + 1, 0);
+        for (size_t i = 0; i < n; ++i)
+            ++counts[key(scratch[i]) >> 16];
+        sum = 0;
+        for (auto &count : counts) {
+            size_t size = count;
+            count = sum;
+            sum += size;
+        }
+        for (size_t i = 0; i < n; ++i)
+            begin[counts[key(scratch[i]) >> 16]++] = scratch[i];
+    }
+    if constexpr (std::is_same_v<T, Click>) {
+        for (auto *first = begin; first != end;) {
+            auto *last = first + 1;
+            while (last != end && last->ts == first->ts)
+                ++last;
+            if (last - first > 1)
+                std::sort(first, last, order);
+            first = last;
+        }
+    }
 }
 
 // Group dense person IDs by counting first, then sort each user's shorter
@@ -35,7 +96,7 @@ void sort_by_person(std::vector<T> &rows, WithinPerson time_order) {
         largest = std::max(largest, row.person);
     }
     if (!differing) {
-        std::sort(rows.begin(), rows.end(), time_order);
+        sort_timeline(rows.data(), rows.data() + rows.size(), time_order);
         return;
     }
     const unsigned shift = __builtin_ctz(differing);
@@ -61,7 +122,7 @@ void sort_by_person(std::vector<T> &rows, WithinPerson time_order) {
     start = 0;
     for (size_t end : ends) {
         if (end > start + 1)
-            std::sort(rows.begin() + start, rows.begin() + end, time_order);
+            sort_timeline(rows.data() + start, rows.data() + end, time_order);
         start = end;
     }
 }

@@ -42,9 +42,11 @@ static void write_table(const fs::path &path, std::vector<std::string> columns,
     auto sink = unwrap(arrow::io::FileOutputStream::Open(path.string()));
     auto properties = parquet::WriterProperties::Builder()
                           .compression(parquet::Compression::SNAPPY)
+                          ->disable_dictionary()
                           ->disable_statistics()
                           ->build();
-    require(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, 65536, properties));
+    require(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink,
+                                       std::max<int64_t>(table->num_rows(), 1), properties));
     require(sink->Close());
 }
 
@@ -55,16 +57,24 @@ static void write_users(const fs::path &path, const std::vector<UserRow> &rows, 
     for (arrow::ArrayBuilder *col :
          std::vector<arrow::ArrayBuilder *>{&people, &days, &sessions, &events, &revenue, &categories})
         require(col->Reserve(rows.size()));
+    int64_t person_bytes = 0, category_bytes = 0;
     for (const auto &row : rows) {
-        require(people.Append(in.people[row.person]));
+        person_bytes += in.people[row.person].size();
+        if (row.top_category >= 0)
+            category_bytes += in.categories[row.top_category].size();
+    }
+    require(people.ReserveData(person_bytes));
+    require(categories.ReserveData(category_bytes));
+    for (const auto &row : rows) {
+        people.UnsafeAppend(in.people[row.person]);
         days.UnsafeAppend(row.day);
         sessions.UnsafeAppend(row.sessions);
         events.UnsafeAppend(row.events);
         revenue.UnsafeAppend(row.revenue);
         if (row.top_category < 0)
-            require(categories.AppendNull());
+            categories.UnsafeAppendNull();
         else
-            require(categories.Append(in.categories[row.top_category]));
+            categories.UnsafeAppend(in.categories[row.top_category]);
     }
     write_table(path, {"user_id", "day", "sessions", "events", "revenue_cents", "top_category"},
                 {unwrap(people.Finish()), unwrap(days.Finish()), unwrap(sessions.Finish()),

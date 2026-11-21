@@ -61,9 +61,9 @@ On an Apple M1 Pro with eight worker threads, the official generator's seed 73 p
 | Implementation | Three runs (seconds) | Median |
 | --- | --- | --- |
 | DuckDB, commit `ec136af` | 28.54, 29.65, 35.26 | 29.65 s |
-| Native C++ | 2.62, 2.39, 1.95 | 2.39 s |
+| Native C++, commit `a1daa54` | 2.62, 2.39, 1.95 | 2.39 s |
 
-The local speedup is 12.4×. The organizer measures rankings on separate Linux machines with hidden data.
+That revision achieved a 12.4× local speedup and an official practice score of 2.60 s. The next revision batches identity lookups, stores common-length identifiers losslessly in an atomic table, and uses radix sorting for large timelines whose observed range fits 32 bits. Other identifier shapes and time ranges use the general algorithms. The organizer measures rankings on separate Linux machines with hidden data.
 
 ## Credits
 
