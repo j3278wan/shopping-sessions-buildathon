@@ -20,6 +20,7 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <unordered_map>
 
 namespace {
 using Text = std::string_view;
@@ -556,12 +557,55 @@ struct Catalog {
     }
 };
 
+// Choose an optional compact representation from actual first fields.
+int event_prefix(const std::vector<Text>& files) {
+    std::array<unsigned,256> counts{};
+    unsigned sample=0;
+    for(Text file:files) {
+        Text body=after_header(file);
+        while(!body.empty() && sample<256) {
+            auto stop=body.find('\n');
+            auto line=body.substr(0,stop);
+            body.remove_prefix(stop==Text::npos?body.size():stop+1);
+            std::array<Text,7> f;
+            if(split_fields(line,f) && !f[0].empty()) {
+                ++sample;
+                if(f[0].size()==9) ++counts[static_cast<unsigned char>(f[0][0])];
+            }
+        }
+        if(sample==256)break;
+    }
+    const auto best=std::max_element(counts.begin(),counts.end());
+    return *best ? static_cast<int>(best-counts.begin()) : -1;
+}
+struct EventId {
+    uint64_t bits=0;
+    static EventId encode(Text text,int prefix,uint32_t& external) {
+        if(text.size()==9 && static_cast<unsigned char>(text[0])==prefix) {
+            uint64_t word;
+            std::memcpy(&word,text.data()+1,8);
+            word^=word>>29;
+            word*=UINT64_C(0x9e3779b97f4a7c15);
+            external=0;
+            return {word^(word>>32)};
+        }
+        external=1;
+        return {reinterpret_cast<uintptr_t>(text.data())};
+    }
+    Text text() const {
+        const char* p=reinterpret_cast<const char*>(static_cast<uintptr_t>(bits));
+        const char* end=p;
+        while(*end!=',' && *end!='"')++end;
+        return {p,static_cast<size_t>(end-p)};
+    }
+};
 struct EventCandidate {
-    Key id;
+    EventId id;
     int64_t ingest, ts;
     uint32_t person, category;
     int32_t cents;
-    uint32_t partition_hash; // Hash bits left after selecting the partition.
+    uint32_t external;
+    bool non_inline() const { return external!=0; }
 };
 
 template <class Output> using WorkerBuckets = std::vector<std::vector<std::vector<Output>>>;
@@ -607,59 +651,146 @@ template <class T> void reserve_buckets(WorkerBuckets<T> &buckets, size_t rows) 
             bucket.reserve(per);
 }
 
-template <class Parse>
-void collect_events(const std::vector<Text> &parts, int threads, std::vector<std::vector<Event>> &out,
-                    Parse parse) {
+struct RelativeEvent {
+    EventId id;
+    int32_t ingest;
+    uint32_t ts, person, purchase;
+    bool non_inline() const { return (purchase >> 31)!=0; }
+};
+static_assert(sizeof(RelativeEvent) == 24);
+
+template <class Stored, class Parse>
+bool collect_event_rows(const std::vector<Text> &parts, int threads, std::vector<std::vector<Event>> &out,
+                        int64_t start_ms, Parse parse) {
+    constexpr bool compact=std::is_same_v<Stored,RelativeEvent>;
+    const int64_t start_sec=start_ms/1000;
+    struct Purchase{uint32_t category;int32_t cents;};
+    std::vector<std::vector<Purchase>> purchases(threads);
     size_t partitions = out.size();
-    WorkerBuckets<EventCandidate> parsed(threads, std::vector<std::vector<EventCandidate>>(partitions));
     auto estimate = estimate_rows(parts);
+    size_t event_shards=partitions;
+    size_t target=std::getenv("SHOPPING_SHARD_ROWS") ? std::stoul(std::getenv("SHOPPING_SHARD_ROWS")) : 40000;
+    while (event_shards < 2048 && estimate/event_shards>target) event_shards*=2;
+    WorkerBuckets<Stored> parsed(threads, std::vector<std::vector<Stored>>(event_shards));
     reserve_buckets(parsed, estimate);
     std::vector<UserCache> caches(threads);
+    std::atomic<bool> needs_wide{false};
     auto marked = Clock::now();
     auto trace = [&](const char *stage) {
         auto now = Clock::now();
         if (std::getenv("SHOPPING_TRACE"))
-            std::fprintf(stderr, "  %s %.3fs\n", stage,
-                         std::chrono::duration<double>(now - marked).count());
+            std::fprintf(stderr, "  %s %.3fs\n", stage, std::chrono::duration<double>(now - marked).count());
         marked = now;
     };
     auto jobs = chunks(parts);
     parallel(jobs.size(), threads, [&](size_t w, size_t j) {
+        if constexpr (compact) if (needs_wide.load(std::memory_order_relaxed)) return;
         batched_rows<EventCandidate>(jobs[j], caches[w], parse, [&](EventCandidate &c) {
-            size_t hash = c.id.hash();
-            size_t part = hash & (partitions - 1);
-            c.partition_hash = static_cast<uint32_t>(hash >> 32);
-            parsed[w][part].push_back(c);
+            const auto hash = c.external ? std::hash<Text>{}(c.id.text()) : c.id.bits;
+            auto& bucket=parsed[w][hash & (event_shards - 1)];
+
+            if constexpr (compact) {
+                if (c.ingest==INVALID_TIME) {
+                    needs_wide.store(true,std::memory_order_relaxed);
+                    return;
+                }
+                int64_t seconds=c.ingest/1000-start_sec;
+                if (seconds<std::numeric_limits<int32_t>::min() || seconds>std::numeric_limits<int32_t>::max()) {
+                    needs_wide.store(true,std::memory_order_relaxed);
+                    return;
+                }
+                const uint32_t time=c.person==NONE ? 0 : static_cast<uint32_t>(c.ts-start_ms);
+                uint32_t detail=0;
+                if(c.cents>0 && c.person!=NONE){
+                    auto& detail_rows=purchases[w];
+                    if(detail_rows.size()>=INT32_MAX){needs_wide.store(true,std::memory_order_relaxed);return;}
+                    detail_rows.push_back({c.category,c.cents});
+                    detail=static_cast<uint32_t>(detail_rows.size());
+                }
+                bucket.push_back({c.id,static_cast<int32_t>(seconds),time,c.person,detail|(c.external<<31)});
+            } else {
+
+                bucket.push_back(c);
+            }
         });
     });
+    if constexpr (compact) if (needs_wide.load(std::memory_order_relaxed)) return false;
     trace("parse and partition");
     WorkerBuckets<Event> winners(threads, std::vector<std::vector<Event>>(partitions));
     reserve_buckets(winners, estimate);
-    parallel(partitions, threads, [&](size_t w, size_t part) {
+    parallel(event_shards, threads, [&](size_t w, size_t part) {
         size_t total = 0;
         for (auto &group : parsed)
             total += group[part].size();
         size_t capacity = 1;
         while (capacity < total + total / 3 + 1)
             capacity *= 2;
-        std::vector<const EventCandidate *> table(capacity);
-        for (auto &group : parsed)
-            for (auto &row : group[part]) {
-                size_t i = row.partition_hash & (capacity - 1);
-                while (table[i] && table[i]->id != row.id)
-                    i = (i + 1) & (capacity - 1);
-                if (!table[i] || row.ingest < table[i]->ingest)
-                    table[i] = &row;
+        if(!total)return;
+        const unsigned shard_bits=__builtin_ctzll(event_shards);
+        const unsigned address_bits=__builtin_ctzll(capacity);
+        const unsigned ref_bits=64-__builtin_clzll(total);
+        const uint64_t ref_mask=(uint64_t{1}<<ref_bits)-1;
+        const unsigned probe_bits=std::min<unsigned>(5,shard_bits);
+        const unsigned max_probe=1u<<probe_bits;
+        std::vector<size_t> starts(parsed.size()+1,0);
+        for(size_t src=0;src<parsed.size();++src)starts[src+1]=starts[src]+parsed[src][part].size();
+        std::vector<uint64_t> table(capacity);
+        std::unordered_map<Text,Stored*> external_keys;
+        std::unordered_map<uint64_t,Stored*> crowded;
+        auto pick=[&](Stored*& old, Stored& row){
+            if(!old)old=&row;
+            else if(row.ingest<old->ingest){old->person=NONE;old=&row;}
+            else row.person=NONE;
+        };
+        for(size_t src=0;src<parsed.size();++src) {
+            auto& rows=parsed[src][part];
+            for(size_t n=0;n<rows.size();++n) {
+                auto& row=rows[n];
+                const uint64_t h=row.id.bits;
+                if(!row.non_inline()) {
+                    const uint64_t ref=starts[src]+n+1;
+                    size_t slot=(h>>shard_bits)&(capacity-1);
+                    const uint64_t upper=(h>>(address_bits+shard_bits))<<probe_bits;
+                    bool done=false;
+                    for(unsigned probe=0;probe<max_probe;++probe,slot=(slot+1)&(capacity-1)){
+                        const uint64_t tag=(upper|probe)<<ref_bits;
+                        const uint64_t word=table[slot];
+                        if(!word){table[slot]=tag|ref;done=true;break;}
+                        if((word&~ref_mask)==tag) {
+                            uint64_t previous=(word&ref_mask)-1;
+                            size_t owner=std::upper_bound(starts.begin(),starts.end(),previous)-starts.begin()-1;
+                            auto& old=parsed[owner][part][previous-starts[owner]];
+                            if(row.ingest<old.ingest){old.person=NONE; table[slot]=tag|ref;}
+                            else row.person=NONE;
+                            done=true;
+                            break;
+                        }
+                    }
+                    if(!done)pick(crowded[h],row);
+                }else{
+                    pick(external_keys[row.id.text()],row);
+                }
             }
-        for (auto *c : table)
-            if (c && c->person != NONE)
-                winners[w][c->person % partitions].push_back({c->person, c->ts, c->category, c->cents});
-        for (auto &group : parsed)
-            std::vector<EventCandidate>().swap(group[part]);
+        }
+        for(size_t src=0;src<parsed.size();++src) {
+            auto& source=parsed[src];
+            for(const auto& row:source[part]) if(row.person!=NONE) {
+                int64_t ts=row.ts;
+                uint32_t category=0; int32_t cents=0;
+                if constexpr(compact){
+                    ts+=start_ms;
+                    const auto detail=row.purchase&INT32_MAX;
+                    if(detail){const auto& p=purchases[src][detail-1];category=p.category;cents=p.cents;}
+                } else { category=row.category;cents=row.cents; }
+                winners[w][row.person & (partitions-1)].push_back({row.person,ts,category,cents});
+            }
+            std::vector<Stored>().swap(source[part]);
+        }
     });
     trace("deduplicate");
     merge_people(winners, threads, out);
     trace("merge by person");
+    return true;
 }
 
 template <class Parse>
@@ -704,17 +835,21 @@ Input ingest(const fs::path &data, int threads, int64_t start_ms, int64_t end_ms
     out.events.resize(partitions);
     out.clicks.resize(partitions);
     tick("lookups");
+    auto event_files=csv_parts(*files,data/"events");
+    const int selected_prefix=event_prefix(event_files);
     auto parse_event = [&](Text line, UserCache &users, EventCandidate &c) {
         std::array<Text, 7> f;
         if (!split_fields(line, f) || f[0].empty())
             return false;
-        c = {Key(f[0]), users.times.valid_f1_ingest(f[3]), 0, NONE, catalog.unknown, 0, 0};
+        uint32_t external;
+        const auto event_id=EventId::encode(f[0],selected_prefix,external);
+        c = {event_id, 0, 0, NONE, catalog.unknown, 0, external};
+        c.ts = users.times.event_pair(f[2], f[3], c.ingest);
         if (f[1].empty() || f[5].empty())
             return true;
         bool purchase = f[4] == "purchase";
         if (!purchase && f[4] != "view" && f[4] != "cart")
             return true;
-        c.ts = users.times.strict(f[2]);
         if (c.ts < start_ms || c.ts >= end_ms || c.ingest == INVALID_TIME || c.ts < c.ingest - DAY)
             return true;
         if (purchase) {
@@ -727,7 +862,10 @@ Input ingest(const fs::path &data, int threads, int64_t start_ms, int64_t end_ms
         c.person = users.queue(people, f[1]);
         return true;
     };
-    collect_events(csv_parts(*files, data / "events"), threads, out.events, parse_event);
+    const uint64_t span=uint64_t(end_ms)-uint64_t(start_ms);
+    if(span>std::numeric_limits<uint32_t>::max() ||
+       !collect_event_rows<RelativeEvent>(event_files,threads,out.events,start_ms,parse_event))
+        collect_event_rows<EventCandidate>(event_files,threads,out.events,start_ms,parse_event);
     tick("events");
     auto parse_click = [&](Text line, UserCache &users, Click &c) {
         std::array<Text, 4> f;

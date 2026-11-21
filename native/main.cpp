@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "time.hpp"
 
 #include <algorithm>
 #include <arrow/api.h>
@@ -153,11 +154,11 @@ static int64_t manifest_time(const std::string &manifest, const std::string &key
     if (!std::regex_search(manifest, match, pattern))
         throw std::runtime_error("Missing " + key + " in manifest.json");
     std::string value = match[1];
-    std::tm utc{};
-    auto end = strptime(value.c_str(), "%Y-%m-%dT%H:%M:%SZ", &utc);
-    if (!end || *end)
+    shopping_time::Parser parser;
+    const int64_t timestamp = parser.strict(value);
+    if (value.size() != 20 || value.back() != 'Z' || timestamp == shopping_time::invalid_time)
         throw std::runtime_error("Invalid manifest UTC time: " + value);
-    return static_cast<int64_t>(timegm(&utc)) * 1000;
+    return timestamp;
 }
 
 static void run() {

@@ -3,12 +3,12 @@ FROM python:3.12-slim-bookworm AS arrow-runtime
 RUN python -m pip install --no-cache-dir --no-deps --only-binary=:all: pyarrow==20.0.0
 
 FROM arrow-runtime AS build
-RUN apt-get update && apt-get install -y --no-install-recommends g++ libc6-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends clang-19 libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY native/ native/
 COPY scripts/build_native.sh scripts/build_native.sh
-RUN sh scripts/build_native.sh /out/shopping-sessions
+RUN CXX=clang++-19 sh scripts/build_native.sh /out/shopping-sessions
 
 FROM arrow-runtime
 WORKDIR /app

@@ -136,6 +136,35 @@ class Parser {
         return midnight + (clock - off*60) * 1000;
     }
 
+    // Ingest timestamps have an exact F1 guarantee. On the common path two
+    // UTC timestamps sharing fourteen bytes share the date and hour.
+    inline int64_t event_pair(Text event, Text ingest, int64_t &ingest_ms) {
+        if (event.size()!=20 || event[19]!='Z' || ingest.size()!=20 || ingest[19]!='Z' ||
+            std::memcmp(ingest.data(), event.data(), 14)!=0) {
+            ingest_ms=valid_f1_ingest(ingest);
+            return strict(event);
+        }
+        auto midnight=date(ingest.data());
+        if(midnight==invalid_time) {
+            ingest_ms=invalid_time;
+            return strict(event);
+        }
+        uint64_t a=word8(ingest.data()+11) & nibbles;
+        a=a*10+(a>>8);
+        int64_t hour=midnight+int64_t(a&255)*3600000;
+        auto minute_seconds=[](uint64_t pairs) {
+            return int((pairs>>24)&255)*60+int((pairs>>48)&255);
+        };
+        ingest_ms=hour+minute_seconds(a)*1000;
+        uint64_t x=word8(event.data()+11), digits=x & nibbles;
+        constexpr uint64_t decimal=UINT64_C(0xffff00ffff000000);
+        if ((x & ~nibbles & decimal)!=UINT64_C(0x3030003030000000) ||
+            ((x>>40)&255)!=':' || ((digits+sixes)&carry&decimal))return invalid_time;
+        uint64_t b=digits*10+(digits>>8);
+        if(((b>>24)&255)>=60 || ((b>>48)&255)>=60)return invalid_time;
+        return hour+minute_seconds(b)*1000;
+    }
+
     // PRECONDITION: exactly a valid 20-byte F1 UTC timestamp. The published
     // contract guarantees this for ingest_ts, not for event.ts or click.ts.
     // This must not be called on arbitrary event/click timestamp strings.

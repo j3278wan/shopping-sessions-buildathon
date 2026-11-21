@@ -22,39 +22,40 @@ compile() {
     shift 2
     "$cxx" "${common[@]}" "$@" native/main.cpp native/ingest.cpp native/reports.cpp "${libs[@]}" -o "$workdir/$name"
 }
-train() {
-    local name=$1
-    mkdir -p "$workdir/train-$name"
-    DATA_DIR="$workdir/train" OUTPUT_DIR="$workdir/train-$name" NCPU=4 "$workdir/$name"
-}
-lscpu | head -32
+lscpu | sed -n '1,32p'
+awk -F': ' '/^flags/{ print "CPU_FEATURES " $2; exit }' /proc/cpuinfo
 baseline=aa826e3d4c002af8a21496bb2845aef61ca44889
 git fetch -q --depth=1 https://github.com/j3278wan/shopping-sessions-buildathon.git "$baseline"
 git worktree add -q --detach "$workdir/previous" FETCH_HEAD
 (cd "$workdir/previous" && compile scored g++)
-compile current g++
-git apply bench/quotient.patch
-compile quotient g++
-git apply bench/x86-scanner.patch
-g++ -std=c++17 -O3 -march=haswell -Inative bench/check-isa.cpp -o "$workdir/check-isa"
+compile candidate clang++-18
+clang++-18 -std=c++17 -O3 -march=haswell -Inative bench/check-isa.cpp -o "$workdir/check-isa"
 "$workdir/check-isa"
-compile quotient-vector g++
-compile quotient-clang clang++-18
-for name in scored current quotient quotient-vector quotient-clang; do
-    python scripts/run_fixtures.py fixtures -- "$workdir/$name" > "$workdir/fixtures-$name.log"
-    tail -1 "$workdir/fixtures-$name.log"
-done
+python scripts/run_fixtures.py fixtures -- "$workdir/candidate" > "$workdir/fixtures.log"
+tail -1 "$workdir/fixtures.log"
+docker build -q -t shopping-candidate .
+chmod 755 "$workdir"
+mkdir "$workdir/container-result" && chmod 777 "$workdir/container-result"
+IMAGE=shopping-candidate CPUS=4 MEM=12g sh scripts/docker_run.sh "$workdir/evaluate" "$workdir/container-result"
 for trial in 1 2 3; do
-    order=(scored current quotient quotient-vector quotient-clang)
-    if [[ $trial == 2 ]]; then order=(quotient-clang quotient-vector quotient current scored); fi
+    order=(scored medium small large)
+    if [[ $trial == 2 ]]; then order=(large small medium scored); fi
     for name in "${order[@]}"; do
         find "$workdir/evaluate" -type f -exec cat {} + > /dev/null
         dest="$workdir/out-$name-$trial"
         mkdir "$dest"
-        env NCPU=4 DATA_DIR="$workdir/evaluate" OUTPUT_DIR="$dest" SHOPPING_TRACE=1 SHOPPING_TIMINGS=1 \
-            /usr/bin/time -f "BENCH $name $trial %e s %M KiB" "$workdir/$name"
+        binary="$workdir/candidate"
+        case "$name" in
+          scored) binary="$workdir/scored"; target=1000000 ;;
+          large) target=1000000 ;;
+          medium) target=160000 ;;
+          small) target=40000 ;;
+        esac
+        env NCPU=4 DATA_DIR="$workdir/evaluate" OUTPUT_DIR="$dest" SHOPPING_TRACE=1 SHOPPING_TIMINGS=1 SHOPPING_SHARD_ROWS="$target" \
+            /usr/bin/time -f "BENCH $name $trial %e s %M KiB" "$binary"
     done
 done
-for name in current quotient quotient-vector quotient-clang; do
+for name in medium small large; do
     python scripts/compare.py "$workdir/out-scored-3" "$workdir/out-$name-3"
 done
+python scripts/compare.py "$workdir/out-scored-3" "$workdir/container-result"
