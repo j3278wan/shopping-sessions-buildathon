@@ -28,6 +28,51 @@ class Parser {
         return (a < 10 && b < 10) ? int(10 * a + b) : -1;
     }
 
+    static uint64_t word8(const char *p) {
+        uint64_t v;
+        std::memcpy(&v,p,8);
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        v=__builtin_bswap64(v);
+#endif
+        return v;
+    }
+    static constexpr uint64_t nibbles = UINT64_C(0x0f0f0f0f0f0f0f0f);
+    static constexpr uint64_t sixes = UINT64_C(0x0606060606060606);
+    static constexpr uint64_t carry = UINT64_C(0x1010101010101010);
+    static bool digits8(uint64_t x) {
+        return (x & ~nibbles)==UINT64_C(0x3030303030303030)
+            && !(((x & nibbles)+sixes) & carry);
+    }
+    // Decimal reductions on independent byte, 16-bit, and 32-bit lanes.
+    static uint32_t decimal8(uint64_t digits) {
+        auto pairs=(digits*10+(digits>>8)) & UINT64_C(0x00ff00ff00ff00ff);
+        auto quads=(pairs*100+(pairs>>16)) & UINT64_C(0x0000ffff0000ffff);
+        return uint32_t(quads)*10000 + uint32_t(quads>>32);
+    }
+    static int64_t epoch13(const char* p) {
+        uint64_t first=word8(p),last=word8(p+5);
+        if (!digits8(first) || !digits8(last))return invalid_time;
+        auto front=decimal8(first & nibbles);
+        auto tail=decimal8(last & UINT64_C(0x0f0f0f0f0f000000));
+        return int64_t(front)*100000+tail;
+    }
+    template<bool Checked> static int seconds(const char* p) {
+        // HH:MM:SS is exactly eight bytes. Adding six to a decimal nibble
+        // crosses bit four only for a non-decimal nibble; no cross-byte carry.
+        uint64_t x=word8(p);
+        auto digits=x & nibbles;
+        if constexpr(Checked) {
+            constexpr uint64_t colon=UINT64_C(0x0000ff0000ff0000);
+            if((x & ~nibbles)!=UINT64_C(0x3030303030303030) ||
+               (x & colon)!=UINT64_C(0x00003a00003a0000) ||
+               ((digits+sixes) & carry & ~colon))return -1;
+        }
+        auto pairs=digits*10+(digits>>8);
+        int hour=pairs&255,minute=(pairs>>24)&255,second=(pairs>>48)&255;
+        if constexpr(Checked)if(hour>=24 || minute>=60 || second>=60)return -1;
+        return hour*3600+minute*60+second;
+    }
+
     inline int64_t date(const char *p) {
         uint64_t first;
         uint16_t last;
@@ -63,6 +108,7 @@ class Parser {
     inline int64_t strict(Text ts) {
         if (ts.empty())
             return invalid_time;
+        if(ts.size()==13)return epoch13(ts.data());
         bool utc = ts.size() == 20 && ts[19] == 'Z';
         bool offset = ts.size() == 25 && (ts[19] == '+' || ts[19] == '-') && ts[22] == ':';
         if ((!utc && !offset) || ts[4] != '-') {
@@ -73,12 +119,10 @@ class Parser {
                 return invalid_time;
             return static_cast<int64_t>(n);
         }
-        if (ts[10] != 'T' || ts[13] != ':' || ts[16] != ':')
-            return invalid_time;
+        if (ts[10] != 'T')return invalid_time;
         const char *p = ts.data();
-        int h = two(p + 11), minute = two(p + 14), sec = two(p + 17);
-        if (h < 0 || h >= 24 || minute < 0 || minute >= 60 || sec < 0 || sec >= 60)
-            return invalid_time;
+        int clock=seconds<true>(p+11);
+        if(clock<0)return invalid_time;
         int off = 0;
         if (offset) {
             int oh = two(p + 20), om = two(p + 23);
@@ -89,7 +133,7 @@ class Parser {
         int64_t midnight = date(p);
         if (midnight == invalid_time)
             return invalid_time;
-        return midnight + ((h * 60 + minute - off) * 60 + sec) * 1000;
+        return midnight + (clock - off*60) * 1000;
     }
 
     // PRECONDITION: exactly a valid 20-byte F1 UTC timestamp. The published
@@ -99,13 +143,11 @@ class Parser {
         if (ts.size() != 20 || ts.back() != 'Z')
             return strict(ts);
         const char *p = ts.data();
-        int h = (p[11] - '0') * 10 + p[12] - '0';
-        int minute = (p[14] - '0') * 10 + p[15] - '0';
-        int sec = (p[17] - '0') * 10 + p[18] - '0';
+        int clock=seconds<false>(p+11);
         const auto midnight = date(p);
         if (midnight == invalid_time)
             return invalid_time;
-        return midnight + ((h * 60 + minute) * 60 + sec) * 1000;
+        return midnight + clock * 1000;
     }
 };
 } // namespace shopping_time

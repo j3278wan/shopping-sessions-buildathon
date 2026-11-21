@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
 #include <fstream>
@@ -37,7 +38,7 @@ static void write_table(const fs::path &path, std::vector<std::string> columns,
                         std::vector<std::shared_ptr<arrow::Array>> arrays) {
     std::vector<std::shared_ptr<arrow::Field>> fields;
     for (size_t i = 0; i < columns.size(); ++i)
-        fields.push_back(arrow::field(columns[i], arrays[i]->type()));
+        fields.push_back(arrow::field(columns[i], arrays[i]->type(), columns[i] == "top_category"));
     auto table = arrow::Table::Make(arrow::schema(std::move(fields)), std::move(arrays));
     auto sink = unwrap(arrow::io::FileOutputStream::Open(path.string()));
     auto properties = parquet::WriterProperties::Builder()
@@ -45,40 +46,65 @@ static void write_table(const fs::path &path, std::vector<std::string> columns,
                           ->disable_dictionary()
                           ->disable_statistics()
                           ->build();
-    require(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink,
-                                       std::max<int64_t>(table->num_rows(), 1), properties));
+    require(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, std::max<int64_t>(table->num_rows(), 1), properties));
     require(sink->Close());
 }
 
 static void write_users(const fs::path &path, const std::vector<UserRow> &rows, const Input &in) {
-    arrow::StringBuilder people, categories;
-    arrow::Date32Builder days;
-    arrow::Int64Builder sessions, events, revenue;
-    for (arrow::ArrayBuilder *col :
-         std::vector<arrow::ArrayBuilder *>{&people, &days, &sessions, &events, &revenue, &categories})
-        require(col->Reserve(rows.size()));
-    int64_t person_bytes = 0, category_bytes = 0;
+    const int64_t size = rows.size();
+    int64_t person_bytes = 0, category_bytes = 0, category_nulls = 0;
     for (const auto &row : rows) {
         person_bytes += in.people[row.person].size();
-        if (row.top_category >= 0)
-            category_bytes += in.categories[row.top_category].size();
+        if (row.top_category >= 0) category_bytes += in.categories[row.top_category].size();
+        else ++category_nulls;
     }
-    require(people.ReserveData(person_bytes));
-    require(categories.ReserveData(category_bytes));
-    for (const auto &row : rows) {
-        people.UnsafeAppend(in.people[row.person]);
-        days.UnsafeAppend(row.day);
-        sessions.UnsafeAppend(row.sessions);
-        events.UnsafeAppend(row.events);
-        revenue.UnsafeAppend(row.revenue);
-        if (row.top_category < 0)
-            categories.UnsafeAppendNull();
-        else
-            categories.UnsafeAppend(in.categories[row.top_category]);
+    if (person_bytes > INT32_MAX || category_bytes > INT32_MAX)
+        throw std::runtime_error("A string column exceeds Arrow's 32-bit offset capacity");
+    auto buffer = [](int64_t bytes) -> std::shared_ptr<arrow::Buffer> {
+        return unwrap(arrow::AllocateBuffer(bytes));
+    };
+    auto people_offsets = buffer((size + 1) * sizeof(int32_t));
+    auto people_data = buffer(person_bytes);
+    auto category_offsets = buffer((size + 1) * sizeof(int32_t));
+    auto category_data = buffer(category_bytes);
+    auto category_valid = buffer((size + 7) / 8);
+    if (category_valid->size()) std::memset(category_valid->mutable_data(), 0, category_valid->size());
+    auto days = buffer(size * sizeof(int32_t));
+    auto sessions = buffer(size * sizeof(int64_t));
+    auto events = buffer(size * sizeof(int64_t));
+    auto revenue = buffer(size * sizeof(int64_t));
+    auto* po = reinterpret_cast<int32_t*>(people_offsets->mutable_data());
+    auto* co = reinterpret_cast<int32_t*>(category_offsets->mutable_data());
+    auto* dv = reinterpret_cast<int32_t*>(days->mutable_data());
+    auto* sv = reinterpret_cast<int64_t*>(sessions->mutable_data());
+    auto* ev = reinterpret_cast<int64_t*>(events->mutable_data());
+    auto* rv = reinterpret_cast<int64_t*>(revenue->mutable_data());
+    int32_t p_at = 0, c_at = 0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const auto& row = rows[i];
+        po[i] = p_at; co[i] = c_at;
+        auto person = in.people[row.person];
+        if (!person.empty()) std::memcpy(people_data->mutable_data() + p_at, person.data(), person.size());
+        p_at += person.size();
+        if (row.top_category >= 0) {
+            auto category = in.categories[row.top_category];
+            if (!category.empty()) std::memcpy(category_data->mutable_data() + c_at, category.data(), category.size());
+            c_at += category.size();
+            category_valid->mutable_data()[i >> 3] |= uint8_t(1U << (i & 7));
+        }
+        dv[i] = row.day; sv[i] = row.sessions; ev[i] = row.events; rv[i] = row.revenue;
     }
+    po[size] = p_at; co[size] = c_at;
+    auto numeric = [size](std::shared_ptr<arrow::DataType> type, std::shared_ptr<arrow::Buffer> values) {
+        return arrow::MakeArray(arrow::ArrayData::Make(type, size, {nullptr, values}, 0));
+    };
+    auto people = arrow::MakeArray(arrow::ArrayData::Make(arrow::utf8(), size,
+        {nullptr, people_offsets, people_data}, 0));
+    auto categories = arrow::MakeArray(arrow::ArrayData::Make(arrow::utf8(), size,
+        {category_valid, category_offsets, category_data}, category_nulls));
     write_table(path, {"user_id", "day", "sessions", "events", "revenue_cents", "top_category"},
-                {unwrap(people.Finish()), unwrap(days.Finish()), unwrap(sessions.Finish()),
-                 unwrap(events.Finish()), unwrap(revenue.Finish()), unwrap(categories.Finish())});
+                {people, numeric(arrow::date32(), days), numeric(arrow::int64(), sessions),
+                 numeric(arrow::int64(), events), numeric(arrow::int64(), revenue), categories});
 }
 
 static void write_campaigns(const fs::path &path, const std::vector<std::vector<CampaignRow>> &parts,

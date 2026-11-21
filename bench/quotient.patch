@@ -1,0 +1,259 @@
+--- a/native/ingest.cpp
++++ b/native/ingest.cpp
+@@ -20,6 +20,7 @@
+ #include <thread>
+ #include <unistd.h>
+ #include <utility>
++#include <unordered_map>
+ 
+ namespace {
+ using Text = std::string_view;
+@@ -556,8 +557,70 @@
+     }
+ };
+ 
++// Choose an optional compact representation from actual first fields.
++int event_prefix(const std::vector<Text>& files) {
++    std::array<unsigned,256> counts{};
++    unsigned sample=0;
++    for(Text file:files) {
++        Text body=after_header(file);
++        while(!body.empty() && sample<256) {
++            auto stop=body.find('\n');
++            auto line=body.substr(0,stop);
++            body.remove_prefix(stop==Text::npos?body.size():stop+1);
++            std::array<Text,7> f;
++            if(split_fields(line,f) && !f[0].empty()) {
++                ++sample;
++                if(f[0].size()==9) ++counts[static_cast<unsigned char>(f[0][0])];
++            }
++        }
++        if(sample==256)break;
++    }
++    const auto best=std::max_element(counts.begin(),counts.end());
++    return *best ? static_cast<int>(best-counts.begin()) : -1;
++}
++struct EventId {
++    static constexpr uint64_t external=UINT64_C(1)<<63;
++    uint64_t bits=0;
++    EventId()=default;
++    EventId(Text text,int prefix) {
++        if(text.size()==9 && static_cast<unsigned char>(text[0])==prefix) {
++            uint64_t word;
++            std::memcpy(&word,text.data()+1,8);
++            if(!(word&UINT64_C(0x8080808080808080))) {
++#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++                word=__builtin_bswap64(word);
++#endif
++#if defined(__BMI2__)
++                word=_pext_u64(word,UINT64_C(0x7f7f7f7f7f7f7f7f));
++#else
++                word=(word&UINT64_C(0x007f007f007f007f))|((word>>1)&UINT64_C(0x3f803f803f803f80));
++                word=(word&UINT64_C(0x00003fff00003fff))|((word>>2)&UINT64_C(0x0fffc0000fffc000));
++                word=(word&UINT64_C(0x000000000fffffff))|((word>>4)&UINT64_C(0x00fffffff0000000));
++#endif
++                // Every operation is invertible on the 56-bit domain.
++                word^=word>>27;
++                word=(word*UINT64_C(0xbf58476d1ce4e5b9))&((UINT64_C(1)<<56)-1);
++                bits=word^(word>>25);
++                return;
++            }
++        }
++        bits=external|reinterpret_cast<uintptr_t>(text.data());
++    }
++    Text text() const {
++        const char* p=reinterpret_cast<const char*>(static_cast<uintptr_t>(bits&~external));
++        auto end=p;
++        while(*end!=',' && *end!='"')++end;
++        return {p,static_cast<size_t>(end-p)};
++    }
++    size_t hash() const { return bits & external ? std::hash<Text>{}(text()) : bits; }
++    bool operator==(const EventId& b) const {
++        return bits==b.bits || ((bits&b.bits&external) && text()==b.text());
++    }
++};
++struct EventHash{size_t operator()(const EventId& id)const{return id.hash();}};
++
+ struct EventCandidate {
+-    Key id;
++    EventId id;
+     int64_t ingest, ts;
+     uint32_t person, category;
+     int32_t cents;
+@@ -607,31 +670,59 @@
+             bucket.reserve(per);
+ }
+ 
+-template <class Parse>
+-void collect_events(const std::vector<Text> &parts, int threads, std::vector<std::vector<Event>> &out,
+-                    Parse parse) {
++struct RelativeEvent {
++    EventId id;
++    int32_t ingest;
++    uint32_t ts, person, category;
++    int32_t cents;
++    uint32_t partition_hash;
++};
++static_assert(sizeof(RelativeEvent) == 32);
++
++template <class Stored, class Parse>
++bool collect_event_rows(const std::vector<Text> &parts, int threads, std::vector<std::vector<Event>> &out,
++                        int64_t start_ms, Parse parse) {
++    constexpr bool compact=std::is_same_v<Stored,RelativeEvent>;
++    const int64_t start_sec=start_ms/1000;
+     size_t partitions = out.size();
+-    WorkerBuckets<EventCandidate> parsed(threads, std::vector<std::vector<EventCandidate>>(partitions));
++    WorkerBuckets<Stored> parsed(threads, std::vector<std::vector<Stored>>(partitions));
+     auto estimate = estimate_rows(parts);
+     reserve_buckets(parsed, estimate);
+     std::vector<UserCache> caches(threads);
++    std::atomic<bool> needs_wide{false};
+     auto marked = Clock::now();
+     auto trace = [&](const char *stage) {
+         auto now = Clock::now();
+         if (std::getenv("SHOPPING_TRACE"))
+-            std::fprintf(stderr, "  %s %.3fs\n", stage,
+-                         std::chrono::duration<double>(now - marked).count());
++            std::fprintf(stderr, "  %s %.3fs\n", stage, std::chrono::duration<double>(now - marked).count());
+         marked = now;
+     };
+     auto jobs = chunks(parts);
+     parallel(jobs.size(), threads, [&](size_t w, size_t j) {
++        if constexpr (compact) if (needs_wide.load(std::memory_order_relaxed)) return;
+         batched_rows<EventCandidate>(jobs[j], caches[w], parse, [&](EventCandidate &c) {
+-            size_t hash = c.id.hash();
+-            size_t part = hash & (partitions - 1);
+-            c.partition_hash = static_cast<uint32_t>(hash >> 32);
+-            parsed[w][part].push_back(c);
++            const auto hash = c.id.hash();
++            auto& bucket=parsed[w][hash & (partitions - 1)];
++            const auto upper=static_cast<uint32_t>(hash >> 32);
++            if constexpr (compact) {
++                if (c.ingest==INVALID_TIME) {
++                    needs_wide.store(true,std::memory_order_relaxed);
++                    return;
++                }
++                int64_t seconds=c.ingest/1000-start_sec;
++                if (seconds<std::numeric_limits<int32_t>::min() || seconds>std::numeric_limits<int32_t>::max()) {
++                    needs_wide.store(true,std::memory_order_relaxed);
++                    return;
++                }
++                const uint32_t time=c.person==NONE ? 0 : static_cast<uint32_t>(c.ts-start_ms);
++                bucket.push_back({c.id,static_cast<int32_t>(seconds),time,c.person,c.category,c.cents,upper});
++            } else {
++                c.partition_hash=upper;
++                bucket.push_back(c);
++            }
+         });
+     });
++    if constexpr (compact) if (needs_wide.load(std::memory_order_relaxed)) return false;
+     trace("parse and partition");
+     WorkerBuckets<Event> winners(threads, std::vector<std::vector<Event>>(partitions));
+     reserve_buckets(winners, estimate);
+@@ -642,24 +733,65 @@
+         size_t capacity = 1;
+         while (capacity < total + total / 3 + 1)
+             capacity *= 2;
+-        std::vector<const EventCandidate *> table(capacity);
+-        for (auto &group : parsed)
+-            for (auto &row : group[part]) {
+-                size_t i = row.partition_hash & (capacity - 1);
+-                while (table[i] && table[i]->id != row.id)
+-                    i = (i + 1) & (capacity - 1);
+-                if (!table[i] || row.ingest < table[i]->ingest)
+-                    table[i] = &row;
+-            }
+-        for (auto *c : table)
+-            if (c && c->person != NONE)
+-                winners[w][c->person % partitions].push_back({c->person, c->ts, c->category, c->cents});
+-        for (auto &group : parsed)
+-            std::vector<EventCandidate>().swap(group[part]);
++        const unsigned worker_bits=threads==1?0:64-__builtin_clzll(threads-1);
++        const auto worker_mask=(uint64_t{1}<<worker_bits)-1;
++        const unsigned shard_bits=__builtin_ctzll(partitions);
++        const unsigned address_bits=__builtin_ctzll(capacity);
++        size_t max_rows=0;
++        for(auto& source:parsed)max_rows=std::max(max_rows,source[part].size());
++        if(!max_rows)return;
++        const uint64_t max_ref=((uint64_t(max_rows-1)<<worker_bits)|uint64_t(threads-1))+1;
++        const unsigned ref_bits=64-__builtin_clzll(max_ref);
++        const uint64_t ref_mask=(uint64_t{1}<<ref_bits)-1;
++        const bool pack=56+5+ref_bits<=64+address_bits+shard_bits;
++        std::vector<uint64_t> table(pack?capacity:0);
++        std::unordered_map<EventId,Stored*,EventHash> extra;
++        auto pick=[&](Stored*& old, Stored& row){
++            if(!old)old=&row;
++            else if(row.ingest<old->ingest){old->person=NONE;old=&row;}
++            else row.person=NONE;
++        };
++        for(size_t src=0;src<parsed.size();++src) {
++            auto& rows=parsed[src][part];
++            for(size_t n=0;n<rows.size();++n) {
++                auto& row=rows[n];
++                const uint64_t h=row.id.bits;
++                if(pack && !(h&EventId::external)) {
++                    const uint64_t ref=((n<<worker_bits)|src)+1;
++                    size_t slot=(h>>shard_bits)&(capacity-1);
++                    const uint64_t upper=(h>>(address_bits+shard_bits))<<5;
++                    bool done=false;
++                    for(unsigned probe=0;probe<32;++probe,slot=(slot+1)&(capacity-1)){
++                        const uint64_t tag=(upper|probe)<<ref_bits;
++                        const uint64_t word=table[slot];
++                        if(!word){table[slot]=tag|ref;done=true;break;}
++                        if((word&~ref_mask)==tag) {
++                            uint64_t previous=(word&ref_mask)-1;
++                            auto& old=parsed[previous&worker_mask][part][previous>>worker_bits];
++                            if(row.ingest<old.ingest){old.person=NONE; table[slot]=tag|ref;}
++                            else row.person=NONE;
++                            done=true;
++                            break;
++                        }
++                    }
++                    if(done)continue;
++                }
++                pick(extra[row.id],row);
++            }
++        }
++        for(auto& source:parsed) {
++            for(const auto& row:source[part]) if(row.person!=NONE) {
++                int64_t ts=row.ts;
++                if constexpr(compact)ts+=start_ms;
++                winners[w][row.person & (partitions-1)].push_back({row.person,ts,row.category,row.cents});
++            }
++            std::vector<Stored>().swap(source[part]);
++        }
+     });
+     trace("deduplicate");
+     merge_people(winners, threads, out);
+     trace("merge by person");
++    return true;
+ }
+ 
+ template <class Parse>
+@@ -704,11 +836,13 @@
+     out.events.resize(partitions);
+     out.clicks.resize(partitions);
+     tick("lookups");
++    auto event_files=csv_parts(*files,data/"events");
++    const int selected_prefix=event_prefix(event_files);
+     auto parse_event = [&](Text line, UserCache &users, EventCandidate &c) {
+         std::array<Text, 7> f;
+         if (!split_fields(line, f) || f[0].empty())
+             return false;
+-        c = {Key(f[0]), users.times.valid_f1_ingest(f[3]), 0, NONE, catalog.unknown, 0, 0};
++        c = {EventId(f[0],selected_prefix), users.times.valid_f1_ingest(f[3]), 0, NONE, catalog.unknown, 0, 0};
+         if (f[1].empty() || f[5].empty())
+             return true;
+         bool purchase = f[4] == "purchase";
+@@ -727,7 +861,10 @@
+         c.person = users.queue(people, f[1]);
+         return true;
+     };
+-    collect_events(csv_parts(*files, data / "events"), threads, out.events, parse_event);
++    const uint64_t span=uint64_t(end_ms)-uint64_t(start_ms);
++    if(span>std::numeric_limits<uint32_t>::max() ||
++       !collect_event_rows<RelativeEvent>(event_files,threads,out.events,start_ms,parse_event))
++        collect_event_rows<EventCandidate>(event_files,threads,out.events,start_ms,parse_event);
+     tick("events");
+     auto parse_click = [&](Text line, UserCache &users, Click &c) {
+         std::array<Text, 4> f;

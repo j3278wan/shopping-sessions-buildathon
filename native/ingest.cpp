@@ -427,41 +427,24 @@ constexpr size_t user_lookup_batch_size = 32;
 
 struct UserCache {
     shopping_time::Parser times;
-    struct Cached {
-        Key name;
-        uint32_t id;
-    };
-    struct Request {
-        Text name;
-        Key key;
-        size_t hash;
-        uint32_t known_id;
-    };
-    std::vector<Cached> slots = std::vector<Cached>(16384);
+    struct Request {Text name; Key key; size_t hash;};
     std::array<Request, user_lookup_batch_size> requests;
-    size_t count = 0;
-    People *people = nullptr;
+    size_t count=0;
+    People* people=nullptr;
 
-    // Return a batch-local request index. Resolve to a person ID before emitting the row.
-    uint32_t queue(People &map, Text name) {
-        const Key key = map.encode(name);
-        const size_t hash = key.hash();
-        const auto &hit = slots[hash & (slots.size() - 1)];
-        const auto id = hit.name == key ? hit.id : NONE;
-        if (id == NONE)
-            map.prefetch(key, hash);
-        people = &map;
-        requests[count] = {name, key, hash, id};
+    // Queue independent requests to keep more than one miss in flight. The
+    // shared dictionary itself contains both the key and the canonical ID.
+    uint32_t queue(People& map, Text name) {
+        auto key=map.encode(name);
+        auto hash=key.hash();
+        map.prefetch(key,hash);
+        people=&map;
+        requests[count]={name,key,hash};
         return static_cast<uint32_t>(count++);
     }
     uint32_t resolve(uint32_t index) {
-        const auto &request = requests[index];
-        if (request.known_id != NONE)
-            return request.known_id;
-        auto &hit = slots[request.hash & (slots.size() - 1)];
-        if (hit.name != request.key)
-            hit = {request.key, people->lookup(request.name, request.key, request.hash)};
-        return hit.id;
+        const auto& request=requests[index];
+        return people->lookup(request.name,request.key,request.hash);
     }
 };
 

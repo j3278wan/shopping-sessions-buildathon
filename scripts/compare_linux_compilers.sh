@@ -27,29 +27,26 @@ train() {
     mkdir -p "$workdir/train-$name"
     DATA_DIR="$workdir/train" OUTPUT_DIR="$workdir/train-$name" NCPU=4 "$workdir/$name"
 }
-printf '%s\n' 'CPU model and advertised instruction sets'
 lscpu | head -32
-compiler=clang++-18
-profiler=llvm-profdata-18
-command -v "$compiler"
-command -v "$profiler"
-compile gcc g++
-compile clang "$compiler"
-mkdir "$workdir/gcc-profile"
-compile gcc-pgo g++ -fprofile-generate="$workdir/gcc-profile" -fprofile-update=atomic
-train gcc-pgo
-compile gcc-pgo g++ -fprofile-use="$workdir/gcc-profile" -fprofile-correction
-compile clang-pgo "$compiler" -fprofile-instr-generate
-LLVM_PROFILE_FILE="$workdir/clang.profraw" train clang-pgo
-"$profiler" merge -o "$workdir/clang.profdata" "$workdir/clang.profraw"
-compile clang-pgo "$compiler" -fprofile-instr-use="$workdir/clang.profdata"
-for name in gcc clang gcc-pgo clang-pgo; do
+baseline=aa826e3d4c002af8a21496bb2845aef61ca44889
+git fetch -q --depth=1 https://github.com/j3278wan/shopping-sessions-buildathon.git "$baseline"
+git worktree add -q --detach "$workdir/previous" FETCH_HEAD
+(cd "$workdir/previous" && compile scored g++)
+compile current g++
+git apply bench/quotient.patch
+compile quotient g++
+git apply bench/x86-scanner.patch
+g++ -std=c++17 -O3 -march=haswell -Inative bench/check-isa.cpp -o "$workdir/check-isa"
+"$workdir/check-isa"
+compile quotient-vector g++
+compile quotient-clang clang++-18
+for name in scored current quotient quotient-vector quotient-clang; do
     python scripts/run_fixtures.py fixtures -- "$workdir/$name" > "$workdir/fixtures-$name.log"
     tail -1 "$workdir/fixtures-$name.log"
 done
 for trial in 1 2 3; do
-    order=(gcc clang gcc-pgo clang-pgo)
-    if [[ $trial == 2 ]]; then order=(clang-pgo gcc-pgo clang gcc); fi
+    order=(scored current quotient quotient-vector quotient-clang)
+    if [[ $trial == 2 ]]; then order=(quotient-clang quotient-vector quotient current scored); fi
     for name in "${order[@]}"; do
         find "$workdir/evaluate" -type f -exec cat {} + > /dev/null
         dest="$workdir/out-$name-$trial"
@@ -58,6 +55,6 @@ for trial in 1 2 3; do
             /usr/bin/time -f "BENCH $name $trial %e s %M KiB" "$workdir/$name"
     done
 done
-for name in clang gcc-pgo clang-pgo; do
-    python scripts/compare.py "$workdir/out-gcc-3" "$workdir/out-$name-3"
+for name in current quotient quotient-vector quotient-clang; do
+    python scripts/compare.py "$workdir/out-scored-3" "$workdir/out-$name-3"
 done
