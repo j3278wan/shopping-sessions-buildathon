@@ -1,0 +1,114 @@
+--- a/native/ingest.cpp
++++ b/native/ingest.cpp
+@@ -722,59 +722,31 @@
+         size_t total = 0;
+         for (auto &group : parsed)
+             total += group[part].size();
+-        size_t capacity = 1;
+-        while (capacity < total + total / 3 + 1)
+-            capacity *= 2;
+         if(!total)return;
+-        const unsigned shard_bits=__builtin_ctzll(event_shards);
+-        const unsigned address_bits=__builtin_ctzll(capacity);
+-        const unsigned ref_bits=64-__builtin_clzll(total);
+-        const uint64_t ref_mask=(uint64_t{1}<<ref_bits)-1;
+-        const unsigned probe_bits=std::min<unsigned>(5,shard_bits);
+-        const unsigned max_probe=1u<<probe_bits;
+-        std::vector<size_t> starts(parsed.size()+1,0);
+-        for(size_t src=0;src<parsed.size();++src)starts[src+1]=starts[src]+parsed[src][part].size();
+-        std::vector<uint64_t> table(capacity);
+-        std::unordered_map<Text,Stored*> external_keys;
+-        std::unordered_map<uint64_t,Stored*> crowded;
+-        auto pick=[&](Stored*& old, Stored& row){
+-            if(!old)old=&row;
+-            else if(row.ingest<old->ingest){old->person=NONE;old=&row;}
+-            else row.person=NONE;
++        size_t bits=64;
++        while(bits<total*8)bits*=2;
++        const unsigned shift=__builtin_ctzll(event_shards);
++        std::vector<uint64_t> seen(bits/64), many(bits/64);
++        size_t repeated=0;
++        for (auto& owner:parsed) for (const auto& row:owner[part]) {
++            if(row.non_inline())continue;
++            const size_t bit=(row.id.bits>>shift)&(bits-1);
++            const uint64_t mask=uint64_t(1)<<(bit&63);
++            const uint64_t old=seen[bit>>6];
++            many[bit>>6]|=old&mask;
++            repeated+=(old&mask)!=0;
++            seen[bit>>6]=old|mask;
++        }
++        size_t cap=1;
++        while(cap<repeated*4+1)cap*=2;
++        struct Pending { Stored* row; size_t worker; };
++        std::vector<Pending> table(cap);
++        std::unordered_map<Text,Pending> external_keys;
++        auto select=[](Pending& previous,Stored& row,size_t src) {
++            if(!previous.row || row.ingest<previous.row->ingest) previous={&row,src};
+         };
+-        for(size_t src=0;src<parsed.size();++src) {
+-            auto& rows=parsed[src][part];
+-            for(size_t n=0;n<rows.size();++n) {
+-                auto& row=rows[n];
+-                const uint64_t h=row.id.bits;
+-                if(!row.non_inline()) {
+-                    const uint64_t ref=starts[src]+n+1;
+-                    size_t slot=(h>>shard_bits)&(capacity-1);
+-                    const uint64_t upper=(h>>(address_bits+shard_bits))<<probe_bits;
+-                    bool done=false;
+-                    for(unsigned probe=0;probe<max_probe;++probe,slot=(slot+1)&(capacity-1)){
+-                        const uint64_t tag=(upper|probe)<<ref_bits;
+-                        const uint64_t word=table[slot];
+-                        if(!word){table[slot]=tag|ref;done=true;break;}
+-                        if((word&~ref_mask)==tag) {
+-                            uint64_t previous=(word&ref_mask)-1;
+-                            size_t owner=std::upper_bound(starts.begin(),starts.end(),previous)-starts.begin()-1;
+-                            auto& old=parsed[owner][part][previous-starts[owner]];
+-                            if(row.ingest<old.ingest){old.person=NONE; table[slot]=tag|ref;}
+-                            else row.person=NONE;
+-                            done=true;
+-                            break;
+-                        }
+-                    }
+-                    if(!done)pick(crowded[h],row);
+-                }else{
+-                    pick(external_keys[row.id.text()],row);
+-                }
+-            }
+-        }
+-        for(size_t src=0;src<parsed.size();++src) {
+-            auto& source=parsed[src];
+-            for(const auto& row:source[part]) if(row.person!=NONE) {
++        auto emit=[&](const Stored& row,size_t src) {
++            if(row.person==NONE)return;
+                 int64_t ts=row.ts;
+                 uint32_t category=0; int32_t cents=0;
+                 if constexpr(compact){
+@@ -783,7 +755,27 @@
+                     if(detail){const auto& p=purchases[src][detail-1];category=p.category;cents=p.cents;}
+                 } else { category=row.category;cents=row.cents; }
+                 winners[w][row.person & (partitions-1)].push_back({row.person,ts,category,cents});
+-            }
++        };
++        for(size_t src=0;src<parsed.size();++src) {
++            for(auto& row:parsed[src][part]){
++                if(row.non_inline()) {
++                    select(external_keys[row.id.text()],row,src);
++                    continue;
++                }
++                const uint64_t h=row.id.bits>>shift;
++                const size_t bit=h&(bits-1);
++                if(!(many[bit>>6]&(uint64_t(1)<<(bit&63)))) {
++                    emit(row,src);
++                    continue;
++                }
++                size_t slot=(h^(h>>23))&(cap-1);
++                while(table[slot].row && table[slot].row->id.bits!=row.id.bits) slot=(slot+1)&(cap-1);
++                select(table[slot],row,src);
++            }
++        }
++        for(const auto& p:table)if(p.row)emit(*p.row,p.worker);
++        for(const auto& p:external_keys)emit(*p.second.row,p.second.worker);
++        for(auto& source:parsed) {
+             std::vector<Stored>().swap(source[part]);
+         }
+     });

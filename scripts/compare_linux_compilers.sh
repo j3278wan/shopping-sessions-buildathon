@@ -23,39 +23,37 @@ compile() {
     "$cxx" "${common[@]}" "$@" native/main.cpp native/ingest.cpp native/reports.cpp "${libs[@]}" -o "$workdir/$name"
 }
 lscpu | sed -n '1,32p'
-awk -F': ' '/^flags/{ print "CPU_FEATURES " $2; exit }' /proc/cpuinfo
 baseline=aa826e3d4c002af8a21496bb2845aef61ca44889
 git fetch -q --depth=1 https://github.com/j3278wan/shopping-sessions-buildathon.git "$baseline"
 git worktree add -q --detach "$workdir/previous" FETCH_HEAD
 (cd "$workdir/previous" && compile scored g++)
-compile candidate clang++-18
-clang++-18 -std=c++17 -O3 -march=haswell -Inative bench/check-isa.cpp -o "$workdir/check-isa"
+compile compact clang++-18
+git apply bench/vbmi2.patch
+clang++-18 -std=c++17 -O3 -march=haswell -Inative bench/check-vbmi.cpp -o "$workdir/check-isa"
+clang++-18 -std=c++17 -O3 -march=haswell -Inative bench/time-scanner.cpp -o "$workdir/time-scanner"
 "$workdir/check-isa"
-python scripts/run_fixtures.py fixtures -- "$workdir/candidate" > "$workdir/fixtures.log"
-tail -1 "$workdir/fixtures.log"
-docker build -q -t shopping-candidate .
-chmod 755 "$workdir"
-mkdir "$workdir/container-result" && chmod 777 "$workdir/container-result"
-IMAGE=shopping-candidate CPUS=4 MEM=12g sh scripts/docker_run.sh "$workdir/evaluate" "$workdir/container-result"
+"$workdir/time-scanner" "$workdir/train/events"
+compile simd clang++-18
+git apply bench/bitmap.patch
+compile bitmap clang++-18
+git apply -R bench/bitmap.patch
+git apply bench/tickets.patch
+compile tickets clang++-18
+for name in simd bitmap tickets; do
+    python scripts/run_fixtures.py fixtures -- "$workdir/$name" > "$workdir/fixtures-$name.log"
+    tail -1 "$workdir/fixtures-$name.log"
+done
 for trial in 1 2 3; do
-    order=(scored medium small large)
-    if [[ $trial == 2 ]]; then order=(large small medium scored); fi
+    order=(scored compact simd bitmap tickets)
+    if [[ $trial == 2 ]]; then order=(tickets bitmap simd compact scored); fi
     for name in "${order[@]}"; do
         find "$workdir/evaluate" -type f -exec cat {} + > /dev/null
         dest="$workdir/out-$name-$trial"
         mkdir "$dest"
-        binary="$workdir/candidate"
-        case "$name" in
-          scored) binary="$workdir/scored"; target=1000000 ;;
-          large) target=1000000 ;;
-          medium) target=160000 ;;
-          small) target=40000 ;;
-        esac
-        env NCPU=4 DATA_DIR="$workdir/evaluate" OUTPUT_DIR="$dest" SHOPPING_TRACE=1 SHOPPING_TIMINGS=1 SHOPPING_SHARD_ROWS="$target" \
-            /usr/bin/time -f "BENCH $name $trial %e s %M KiB" "$binary"
+        env NCPU=4 DATA_DIR="$workdir/evaluate" OUTPUT_DIR="$dest" SHOPPING_TRACE=1 SHOPPING_TIMINGS=1 SHOPPING_SHARD_ROWS=160000 \
+            /usr/bin/time -f "BENCH $name $trial %e s %M KiB" "$workdir/$name"
     done
 done
-for name in medium small large; do
+for name in compact simd bitmap tickets; do
     python scripts/compare.py "$workdir/out-scored-3" "$workdir/out-$name-3"
 done
-python scripts/compare.py "$workdir/out-scored-3" "$workdir/container-result"
